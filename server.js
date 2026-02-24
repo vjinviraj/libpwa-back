@@ -25,7 +25,7 @@ app.use(cors({
     'http://localhost:4173',  // Add this - your current dev server
     'http://localhost:5173',  // Vite default
     'https://pwalib-frontend.vercel.app', // Your actual Vercel domain
-    'https://your-actual-frontend-domain.vercel.app' // Replace with your real domain
+    'https://libpwa-frontend.vercel.app/' // Replace with your real domain
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
