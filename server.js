@@ -22,10 +22,9 @@ const geminiModels = [
 // Updated CORS configuration
 app.use(cors({
   origin: [
-    'http://localhost:4173',  // Add this - your current dev server
-    'http://localhost:5173',  // Vite default
-    'https://pwalib-frontend.vercel.app', // Your actual Vercel domain
-    'https://libpwa-frontend.vercel.app/' // Replace with your real domain
+    'http://localhost:5173',
+    'http://localhost:4173',
+    'https://libpwa-frontend.vercel.app'  // your exact Vercel URL
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
