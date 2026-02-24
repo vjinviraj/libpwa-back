@@ -35,9 +35,12 @@ app.use(express.json());
 
 // Configure AWS S3
 const s3 = new AWS.S3({
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  region: process.env.AWS_REGION
+  accessKeyId: process.env.R2_ACCESS_KEY_ID,
+  secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  region: 'auto',
+  signatureVersion: 'v4',
+  s3ForcePathStyle: true
 });
 
 // Configure multer for file uploads
@@ -56,27 +59,33 @@ const upload = multer({
 });
 
 // Upload file to S3 - NO ACL
-const uploadToS3 = (file, folder) => {
+const uploadToS3 = async (file, folder) => {
+  const key = `${folder}/${Date.now()}_${file.originalname}`;
+
   const params = {
-    Bucket: process.env.S3_BUCKET_NAME,
-    Key: `${folder}/${Date.now()}_${file.originalname}`,
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: key,
     Body: file.buffer,
     ContentType: file.mimetype
-    // ACL removed - using bucket policy instead
+    // No ACL - R2 doesn't support it
   };
 
-  return s3.upload(params).promise();
+  await s3.upload(params).promise();
+
+  return {
+    Location: `${process.env.R2_PUBLIC_URL}/${key}`,
+    Key: key
+  };
 };
 
 // Delete file from S3
 const deleteFromS3 = (fileUrl) => {
-  const key = fileUrl.split('/').slice(3).join('/');
-  const params = {
-    Bucket: process.env.S3_BUCKET_NAME,
-    Key: key
-  };
+  const key = fileUrl.replace(`${process.env.R2_PUBLIC_URL}/`, '');
 
-  return s3.deleteObject(params).promise();
+  return s3.deleteObject({
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: key
+  }).promise();
 };
 
 // AI Summary Generation Helper Function - USING GEMINI 2.5 FLASH
@@ -244,38 +253,14 @@ app.get('/api/health', (req, res) => {
 // Test AWS connectivity
 app.get('/api/test-aws', async (req, res) => {
   try {
-    // Just test if we can access our specific bucket
-    const bucketParams = {
-      Bucket: process.env.S3_BUCKET_NAME
-    };
-    
-    await s3.headBucket(bucketParams).promise();
-    
-    res.json({
-      status: 'AWS Connected',
-      bucketExists: true,
-      bucketName: process.env.S3_BUCKET_NAME
+    await s3.headBucket({ Bucket: process.env.R2_BUCKET_NAME }).promise();
+    res.json({ 
+      status: 'R2 Connected ✅', 
+      bucket: process.env.R2_BUCKET_NAME,
+      publicUrl: process.env.R2_PUBLIC_URL
     });
-    
   } catch (error) {
-    console.error('AWS Test Error:', error);
-    
-    if (error.code === 'NotFound') {
-      res.status(500).json({
-        status: 'Bucket Not Found',
-        error: `Bucket '${process.env.S3_BUCKET_NAME}' does not exist`
-      });
-    } else if (error.code === 'AccessDenied') {
-      res.status(500).json({
-        status: 'Access Denied',
-        error: 'IAM user does not have permission to access this bucket'
-      });
-    } else {
-      res.status(500).json({
-        status: 'AWS Connection Failed',
-        error: error.message
-      });
-    }
+    res.status(500).json({ status: 'R2 Connection Failed ❌', error: error.message });
   }
 });
 
