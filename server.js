@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const AWS = require('aws-sdk');
-const { GoogleGenAI } = require('@google/genai'); // Make sure you have the NEW SDK
+const { GoogleGenAI } = require('@google/genai');
 require('dotenv').config();
 
 const app = express();
@@ -10,21 +10,11 @@ const app = express();
 // Initialize Google Generative AI
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-// Test these model names in order
-const geminiModels = [
-  "gemini-2.0-flash",        // Latest fast model
-  "gemini-2.0-flash-exp",    // Experimental version
-  "gemini-1.5-flash",        // Previous fast model
-  "gemini-1.5-pro",          // High quality model
-  "gemini-1.5-flash-001"     // Specific version
-];
-
-// Updated CORS configuration
 app.use(cors({
   origin: [
     'http://localhost:5173',
     'http://localhost:4173',
-    'https://libpwa-frontend.vercel.app'  // your exact Vercel URL
+    'https://libpwa-frontend.vercel.app'
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
@@ -32,22 +22,24 @@ app.use(cors({
 
 app.use(express.json());
 
-// Configure AWS S3
+// Configure AWS S3 (Cloudflare R2)
 const s3 = new AWS.S3({
   accessKeyId: process.env.R2_ACCESS_KEY_ID,
   secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
   endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   region: 'auto',
   signatureVersion: 'v4',
-  s3ForcePathStyle: true
+  s3ForcePathStyle: true,
+  httpOptions: {
+    timeout: 300000,      // 5 min timeout for large files
+    connectTimeout: 10000 // 10s connect timeout
+  }
 });
 
-// Configure multer for file uploads
+// Use memoryStorage but increase limit — we'll stream via multipart
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB limit
-  },
+  limits: { fileSize: 50 * 1024 * 1024 }, // increased to 50MB
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'application/pdf') {
       cb(null, true);
@@ -57,19 +49,85 @@ const upload = multer({
   }
 });
 
-// Upload file to S3 - NO ACL
+// Upload using S3 multipart — much faster for large files
 const uploadToS3 = async (file, folder) => {
   const key = `${folder}/${Date.now()}_${file.originalname}`;
+  const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks (S3 minimum)
 
-  const params = {
+  // For small files under 10MB, use regular upload
+  if (file.buffer.length < 10 * 1024 * 1024) {
+    const params = {
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: key,
+      Body: file.buffer,
+      ContentType: file.mimetype,
+    };
+    await s3.upload(params).promise();
+    return {
+      Location: `${process.env.R2_PUBLIC_URL}/${key}`,
+      Key: key
+    };
+  }
+
+  // For larger files, use multipart upload
+  console.log(`Using multipart upload for ${(file.buffer.length / 1024 / 1024).toFixed(1)}MB file`);
+
+  const multipart = await s3.createMultipartUpload({
     Bucket: process.env.R2_BUCKET_NAME,
     Key: key,
-    Body: file.buffer,
-    ContentType: file.mimetype
-    // No ACL - R2 doesn't support it
-  };
+    ContentType: file.mimetype,
+  }).promise();
 
-  await s3.upload(params).promise();
+  const uploadId = multipart.UploadId;
+  const parts = [];
+
+  try {
+    // Split buffer into chunks and upload in parallel
+    const chunks = [];
+    for (let i = 0; i < file.buffer.length; i += CHUNK_SIZE) {
+      chunks.push(file.buffer.slice(i, i + CHUNK_SIZE));
+    }
+
+    // Upload chunks with concurrency limit of 3
+    const CONCURRENCY = 3;
+    for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+      const batch = chunks.slice(i, i + CONCURRENCY);
+      const batchResults = await Promise.all(
+        batch.map((chunk, batchIndex) => {
+          const partNumber = i + batchIndex + 1;
+          console.log(`Uploading part ${partNumber}/${chunks.length}`);
+          return s3.uploadPart({
+            Bucket: process.env.R2_BUCKET_NAME,
+            Key: key,
+            UploadId: uploadId,
+            PartNumber: partNumber,
+            Body: chunk,
+          }).promise().then(data => ({ ETag: data.ETag, PartNumber: partNumber }));
+        })
+      );
+      parts.push(...batchResults);
+    }
+
+    // Sort parts by part number before completing
+    parts.sort((a, b) => a.PartNumber - b.PartNumber);
+
+    await s3.completeMultipartUpload({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: key,
+      UploadId: uploadId,
+      MultipartUpload: { Parts: parts },
+    }).promise();
+
+    console.log(`✅ Multipart upload complete: ${key}`);
+  } catch (err) {
+    // Clean up failed multipart upload
+    await s3.abortMultipartUpload({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: key,
+      UploadId: uploadId,
+    }).promise();
+    throw err;
+  }
 
   return {
     Location: `${process.env.R2_PUBLIC_URL}/${key}`,
@@ -80,125 +138,62 @@ const uploadToS3 = async (file, folder) => {
 // Delete file from S3
 const deleteFromS3 = (fileUrl) => {
   const key = fileUrl.replace(`${process.env.R2_PUBLIC_URL}/`, '');
-
   return s3.deleteObject({
     Bucket: process.env.R2_BUCKET_NAME,
     Key: key
   }).promise();
 };
 
-// AI Summary Generation Helper Function - USING GEMINI 2.5 FLASH
+// AI Summary Generation
 const generateSummaryFromMetadata = async (title, author, category) => {
   try {
-    console.log('Generating AI summary for:', title);
-    
     const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",  // Use 2.0-flash (2.5 might not be widely available yet)
+      model: "gemini-2.0-flash",
       contents: `Create a specific, accurate 3-sentence technical summary for the book "${title}" by ${author || 'unknown author'}. 
-      
       Research and explain:
-      - What the actual subject matter is (if it's "Zigbee Introduction", explain what Zigbee technology is)
+      - What the actual subject matter is
       - Key concepts or topics covered
       - Why this is valuable for engineering/computer science students
-      
-      Be specific and avoid generic phrases. Provide real technical details about the topic.`
+      Be specific and avoid generic phrases.`
     });
-
-    const summary = response.text;
-    console.log('✅ AI Summary generated successfully with Gemini 2.0 Flash');
-    return summary;
-    
+    return response.text;
   } catch (error) {
     console.error('AI Generation Error:', error);
-    
-    // Try gemini-1.5-flash as fallback if 2.0 doesn't work
     try {
-      console.log('Trying gemini-1.5-flash as fallback...');
       const fallbackResponse = await ai.models.generateContent({
         model: "gemini-1.5-flash",
         contents: `Briefly summarize what "${title}" by ${author} is about for engineering students.`
       });
       return fallbackResponse.text;
     } catch (fallbackError) {
-      console.error('Fallback also failed:', fallbackError);
-      return `"${title}" provides comprehensive coverage of ${category ? category.toLowerCase() : 'technical'} concepts essential for TCET Mumbai students. The book offers both theoretical foundations and practical applications relevant to modern engineering challenges.`;
+      return `"${title}" provides comprehensive coverage of ${category ? category.toLowerCase() : 'technical'} concepts essential for TCET Mumbai students.`;
     }
   }
 };
 
 // ==================== ROUTES ====================
 
-// AI Summary Generation Route
 app.post('/api/books/generate-summary', async (req, res) => {
   try {
     const { title, author, category } = req.body;
-
-    if (!title) {
-      return res.status(400).json({ error: 'Book title is required' });
-    }
-
-    console.log('Generating AI summary for:', title);
+    if (!title) return res.status(400).json({ error: 'Book title is required' });
     const summary = await generateSummaryFromMetadata(title, author, category);
-    
-    console.log('AI summary generated successfully');
     res.json({ summary });
-
   } catch (error) {
-    console.error('Summary generation error:', error);
-    res.status(500).json({ 
-      error: 'Failed to generate summary',
-      details: error.message 
-    });
-  }
-});
-
-// Test route for Gemini 2.5/2.0 Flash
-app.get('/api/ai/test-gemini-2', async (req, res) => {
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
-      contents: "Explain what Zigbee technology is in 2 sentences for engineering students."
-    });
-    
-    res.json({ 
-      status: '✅ Gemini 2.0 Flash Working!',
-      model: 'gemini-2.0-flash',
-      response: response.text 
-    });
-  } catch (error) {
-    // Try 1.5 if 2.0 fails
-    try {
-      const fallbackResponse = await ai.models.generateContent({
-        model: "gemini-1.5-flash", 
-        contents: "Say 'Hello World' in one word."
-      });
-      
-      res.json({ 
-        status: '✅ Gemini 1.5 Flash Working (2.0 not available)',
-        model: 'gemini-1.5-flash',
-        response: fallbackResponse.text 
-      });
-    } catch (fallbackError) {
-      res.status(500).json({ 
-        error: 'Both Gemini models failed',
-        details: fallbackError.message,
-        availableModels: 'Try: gemini-2.0-flash, gemini-1.5-flash, gemini-1.5-pro'
-      });
-    }
+    res.status(500).json({ error: 'Failed to generate summary', details: error.message });
   }
 });
 
 app.post('/api/upload/book', upload.single('file'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-    console.log('Uploading file to S3...');
+    const fileSizeMB = (req.file.size / 1024 / 1024).toFixed(1);
+    console.log(`📚 Uploading book: ${req.file.originalname} (${fileSizeMB}MB)`);
+
     const result = await uploadToS3(req.file, 'books');
-    
-    console.log('Upload successful:', result.Location);
-    
+    console.log('✅ Book upload successful');
+
     res.json({
       message: 'Book uploaded successfully',
       fileUrl: result.Location,
@@ -206,22 +201,15 @@ app.post('/api/upload/book', upload.single('file'), async (req, res) => {
     });
   } catch (error) {
     console.error('Upload error:', error);
-    res.status(500).json({ 
-      error: 'Failed to upload book',
-      details: error.message 
-    });
+    res.status(500).json({ error: 'Failed to upload book', details: error.message });
   }
 });
 
 app.post('/api/upload/notice', upload.single('file'), async (req, res) => {
   try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const result = await uploadToS3(req.file, 'notices');
-    
-    res.json({
-      message: 'Notice uploaded successfully',
-      fileUrl: result.Location,
-      key: result.Key
-    });
+    res.json({ message: 'Notice uploaded successfully', fileUrl: result.Location, key: result.Key });
   } catch (error) {
     console.error('Upload error:', error);
     res.status(500).json({ error: 'Failed to upload notice' });
@@ -231,43 +219,40 @@ app.post('/api/upload/notice', upload.single('file'), async (req, res) => {
 app.delete('/api/delete-file', async (req, res) => {
   try {
     const { fileUrl } = req.body;
-    
-    if (!fileUrl) {
-      return res.status(400).json({ error: 'File URL is required' });
-    }
-
+    if (!fileUrl) return res.status(400).json({ error: 'File URL is required' });
     await deleteFromS3(fileUrl);
     res.json({ message: 'File deleted successfully' });
   } catch (error) {
-    console.error('Delete error:', error);
     res.status(500).json({ error: 'Failed to delete file' });
   }
 });
 
-// Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', message: 'Backend server is running' });
 });
 
-// Test AWS connectivity
 app.get('/api/test-aws', async (req, res) => {
   try {
     await s3.headBucket({ Bucket: process.env.R2_BUCKET_NAME }).promise();
-    res.json({ 
-      status: 'R2 Connected ✅', 
-      bucket: process.env.R2_BUCKET_NAME,
-      publicUrl: process.env.R2_PUBLIC_URL
-    });
+    res.json({ status: 'R2 Connected ✅', bucket: process.env.R2_BUCKET_NAME });
   } catch (error) {
     res.status(500).json({ status: 'R2 Connection Failed ❌', error: error.message });
   }
 });
 
-
+app.get('/api/ai/test-gemini-2', async (req, res) => {
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-2.0-flash",
+      contents: "Explain what Zigbee technology is in 2 sentences for engineering students."
+    });
+    res.json({ status: '✅ Gemini 2.0 Flash Working!', response: response.text });
+  } catch (error) {
+    res.status(500).json({ error: 'Gemini failed', details: error.message });
+  }
+});
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`Backend server running on port ${PORT}`);
-  console.log(`CORS enabled for all origins`);
-  console.log(`AI Summary route: POST /api/books/generate-summary`);
+  console.log(`✅ Backend server running on port ${PORT}`);
 });
